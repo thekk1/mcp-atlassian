@@ -3142,6 +3142,13 @@ async def get_attachment_images(
 
 _LIST_MAX_TERMS = 1000
 _LIST_COUNT_MAX = 20000
+_LIST_JQL_FIELDS = {
+    "component": "components",
+    "label": "labels",
+    "type": "issuetype",
+    "fixversion": "fixVersions",
+    "affectedversion": "versions",
+}
 _LIST_PAGE_SIZE = 1000
 _LIST_KEY_CHUNK = 50
 _LIST_TEXT_CHUNK = 15
@@ -3195,10 +3202,11 @@ def _list_value(value: Any) -> Any:
 
 def _list_field_ids(jira: Any, names: list[str]) -> dict[str, str]:
     """Map field names to field IDs: Jira returns fields only under their ID, and "sprint" is a
-    customfield. Unknown names raise an error, they would come back empty."""
+    customfield. JQL names of system fields take precedence, a custom field can have the same name.
+    Unknown names raise an error, they would come back empty."""
     ids: dict[str, str] = {}
     for name in names:
-        field = "key" if name == "key" else jira.get_field_id(name)
+        field = "key" if name == "key" else _LIST_JQL_FIELDS.get(name.lower()) or jira.get_field_id(name)
         if not field:
             raise ValueError(f"Unknown field: {name}")
         ids[name] = field
@@ -3430,6 +3438,11 @@ async def list_all(
             for item in (value if isinstance(value, list) else [value]) or [None]:
                 label = "(none)" if item in (None, "") else str(item)
                 counts[label] = counts.get(label, 0) + 1
+        if set(counts) == {"(none)"}:
+            raise ValueError(
+                f"None of the {len(issues)} issues has a value in field {name} ({field}). "
+                "Check the field name before concluding that the field is unused."
+            )
         return json.dumps(
             {
                 "total": min(len(issues), _LIST_COUNT_MAX),
