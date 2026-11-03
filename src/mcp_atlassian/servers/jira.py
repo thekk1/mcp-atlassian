@@ -3136,6 +3136,97 @@ async def get_attachment_images(
     )
 
 
+_ATTACHMENT_FILE_MAX_BYTES = 25 * 1024 * 1024
+
+
+@jira_mcp.tool(tags={"jira", "read"})
+async def get_attachment_file(
+    ctx: Context,
+    issue_key: Annotated[
+        str, Field(description="Jira issue key with the attachment (e.g., 'PROJ-123')")
+    ],
+    filename: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) File name of the attachment. If several attachments share "
+                "the name, the newest is returned. Give filename or attachment_id."
+            ),
+            default=None,
+        ),
+    ] = None,
+    attachment_id: Annotated[
+        str | None,
+        Field(description="(Optional) ID of the attachment.", default=None),
+    ] = None,
+) -> str:
+    """Return one attachment of a Jira issue, of any type, as base64.
+
+    The result is JSON with issue_key, attachment_id, filename, mime_type, size and
+    content_base64 (at most 25 MB). Use it when the file itself is needed, for example to
+    pass it on to another tool; for the text of a document use jira_summarize_attachments,
+    to look at images use jira_get_attachment_images.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key (e.g., 'PROJ-123').
+        filename: File name of the attachment.
+        attachment_id: ID of the attachment.
+
+    Returns:
+        JSON string with the attachment metadata and content_base64.
+    """
+    import base64
+
+    if not filename and not attachment_id:
+        raise ValueError("Give filename or attachment_id.")
+    jira = await get_jira_fetcher(ctx)
+    issue_data = await asyncio.to_thread(
+        jira.jira.issue, issue_key, fields="attachment"
+    )
+    if not isinstance(issue_data, dict) or "fields" not in issue_data:
+        raise ValueError(f"Could not retrieve issue {issue_key}.")
+    attachments = [
+        att
+        for att in issue_data.get("fields", {}).get("attachment", []) or []
+        if isinstance(att, dict)
+    ]
+    if attachment_id:
+        matches = [
+            att for att in attachments if str(att.get("id")) == str(attachment_id)
+        ]
+    else:
+        matches = [att for att in attachments if att.get("filename") == filename]
+    if not matches:
+        names = ", ".join(sorted({str(att.get("filename", "")) for att in attachments}))
+        raise ValueError(
+            f"No attachment {attachment_id or filename!r} on {issue_key}. "
+            f"Attachments: {names or 'none'}"
+        )
+    att = max(matches, key=lambda item: str(item.get("created", "")))
+    size = int(att.get("size") or 0)
+    if size > _ATTACHMENT_FILE_MAX_BYTES:
+        raise ValueError(
+            f"{att.get('filename')} is {size} bytes, larger than {_ATTACHMENT_FILE_MAX_BYTES}."
+        )
+    data = await asyncio.to_thread(
+        _download_attachment_bytes, jira.jira._session, att.get("content", "")
+    )
+    if len(data) > _ATTACHMENT_FILE_MAX_BYTES:
+        raise ValueError(
+            f"{att.get('filename')} is {len(data)} bytes, larger than {_ATTACHMENT_FILE_MAX_BYTES}."
+        )
+    result = {
+        "issue_key": issue_key,
+        "attachment_id": str(att.get("id", "")),
+        "filename": att.get("filename", ""),
+        "mime_type": att.get("mimeType", "application/octet-stream"),
+        "size": len(data),
+        "content_base64": base64.b64encode(data).decode("ascii"),
+    }
+    return json.dumps(result, ensure_ascii=False)
+
+
 # --- List tools: check or list many issues in one call -----------------------------------------
 # The model passes a whole list; the server does the paging (Jira Cloud: nextPageToken) and the
 # matching, so a comparison needs one tool call instead of one search per item.

@@ -2706,3 +2706,50 @@ class TestCreateIssueLinkErrorHandling:
 
         assert payload == {"success": True, "id": "123"}
         fetcher.add_issue_link_via_update.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for get_attachment_file
+# ---------------------------------------------------------------------------
+
+
+async def _call_get_attachment_file(mock_jira_fetcher, **params):
+    from mcp_atlassian.servers.jira import get_attachment_file
+
+    ctx = MagicMock()
+    with patch(
+        "mcp_atlassian.servers.jira.get_jira_fetcher",
+        AsyncMock(return_value=mock_jira_fetcher),
+    ):
+        return await get_attachment_file.fn(ctx, **params)
+
+
+@pytest.mark.anyio
+async def test_get_attachment_file_returns_base64(mock_jira_fetcher):
+    """Any attachment type is returned as JSON with content_base64."""
+    import base64
+
+    mock_jira_fetcher.jira.issue.return_value = _make_issue_response(
+        [_PNG_ATTACHMENT, _PDF_ATTACHMENT]
+    )
+    mock_jira_fetcher.jira._session.get.return_value = _mock_download_response(
+        b"%PDF-1.4 binary"
+    )
+    result = json.loads(
+        await _call_get_attachment_file(
+            mock_jira_fetcher, issue_key="PROJ-1", filename=_PDF_ATTACHMENT["filename"]
+        )
+    )
+    assert result["filename"] == _PDF_ATTACHMENT["filename"]
+    assert base64.b64decode(result["content_base64"]) == b"%PDF-1.4 binary"
+    assert result["size"] == len(b"%PDF-1.4 binary")
+
+
+@pytest.mark.anyio
+async def test_get_attachment_file_unknown_name(mock_jira_fetcher):
+    """An unknown name raises an error that lists the attachments."""
+    mock_jira_fetcher.jira.issue.return_value = _make_issue_response([_PNG_ATTACHMENT])
+    with pytest.raises(ValueError, match="screenshot.png"):
+        await _call_get_attachment_file(
+            mock_jira_fetcher, issue_key="PROJ-1", filename="missing.pdf"
+        )
