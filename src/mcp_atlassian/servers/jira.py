@@ -3228,6 +3228,38 @@ async def get_attachment_file(
 
 
 _MARKDOWN_MAX_MENTIONS = 50
+_MARKDOWN_SPRINT_TYPE = "com.pyxis.greenhopper.jira:gh-sprint"
+_MARKDOWN_SPRINT_TEXT = re.compile(r"[\[,](state|name)=([^,\]]*)")
+
+
+def _markdown_sprint_fields(fetcher: Any) -> list[str]:
+    """IDs of the Sprint custom fields (schema type gh-sprint)."""
+    return [
+        str(field["id"])
+        for field in fetcher.get_fields() or []
+        if isinstance(field, dict)
+        and (field.get("schema") or {}).get("custom") == _MARKDOWN_SPRINT_TYPE
+        and field.get("id")
+    ]
+
+
+def _markdown_sprints(fields: dict, sprint_fields: list[str]) -> list[dict[str, str]]:
+    """Name and state of every sprint of the issue, in the order Jira returns them. Cloud returns
+    objects, Server/Data Center strings like "...Sprint@1[id=1,state=ACTIVE,name=Sprint 1,...]"."""
+    sprints: list[dict[str, str]] = []
+    for field_id in sprint_fields:
+        value = fields.get(field_id)
+        for item in value if isinstance(value, list) else [value] if value else []:
+            if isinstance(item, dict):
+                name, state = item.get("name"), item.get("state")
+            elif isinstance(item, str):
+                parts = dict(_MARKDOWN_SPRINT_TEXT.findall(item))
+                name, state = parts.get("name"), parts.get("state")
+            else:
+                continue
+            if name:
+                sprints.append({"name": str(name), "state": str(state or "").lower()})
+    return sprints
 
 
 def _resolve_mentions(client: Any, accounts: list[str]) -> dict[str, str]:
@@ -3268,7 +3300,8 @@ async def get_issue_markdown(
     with the attachment file name as target, so the target can be replaced by the URL of the
     uploaded copy.
 
-    The result is JSON with issue_key, url, summary, issue_type, status, the file
+    The result is JSON with issue_key, url, summary, issue_type, status, priority, sprints
+    (name and state active/future/closed of every sprint of the issue), the file
     (filename '<KEY>.md', mime_type text/markdown, content_base64), images (file names in the
     order of the text), attachment_links, attachments (id, filename, mime_type, size),
     referenced_but_missing, attached_but_not_referenced, unconverted (macros left as text),
@@ -3287,10 +3320,22 @@ async def get_issue_markdown(
     from mcp_atlassian.preprocessing.jira_wiki_markdown import wiki_to_markdown
 
     jira = await get_jira_fetcher(ctx)
+    sprint_fields = await asyncio.to_thread(_markdown_sprint_fields, jira)
     issue_data = await asyncio.to_thread(
         jira.jira.issue,
         issue_key,
-        fields="summary,description,attachment,issuetype,status,comment",
+        fields=",".join(
+            [
+                "summary",
+                "description",
+                "attachment",
+                "issuetype",
+                "status",
+                "priority",
+                "comment",
+            ]
+            + sprint_fields
+        ),
     )
     if not isinstance(issue_data, dict) or "fields" not in issue_data:
         raise ValueError(f"Could not retrieve issue {issue_key}.")
@@ -3337,10 +3382,14 @@ async def get_issue_markdown(
         "summary": fields.get("summary", ""),
         "issue_type": (fields.get("issuetype") or {}).get("name", ""),
         "status": (fields.get("status") or {}).get("name", ""),
+        "priority": (fields.get("priority") or {}).get("name", ""),
+        "sprints": _markdown_sprints(fields, sprint_fields),
         "file": {
             "filename": f"{key}.md",
             "mime_type": "text/markdown",
-            "content_base64": base64.b64encode(markdown.encode("utf-8")).decode("ascii"),
+            "content_base64": base64.b64encode(markdown.encode("utf-8")).decode(
+                "ascii"
+            ),
         },
         "images": conversion.images,
         "attachment_links": conversion.attachment_links,
