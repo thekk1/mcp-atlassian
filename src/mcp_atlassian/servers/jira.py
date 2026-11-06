@@ -3227,6 +3227,133 @@ async def get_attachment_file(
     return json.dumps(result, ensure_ascii=False)
 
 
+_MARKDOWN_MAX_MENTIONS = 50
+
+
+def _resolve_mentions(client: Any, accounts: list[str]) -> dict[str, str]:
+    """Map account IDs to display names; unresolved IDs are left out."""
+    names: dict[str, str] = {}
+    for account in accounts:
+        try:
+            user = client.user(account_id=account)
+        except Exception as exc:  # noqa: BLE001 - unresolved mentions stay as text
+            logger.debug("Could not resolve mention %s: %s", account, exc)
+            continue
+        if isinstance(user, dict) and user.get("displayName"):
+            names[account] = user["displayName"]
+    return names
+
+
+@jira_mcp.tool(tags={"jira", "read"})
+async def get_issue_markdown(
+    ctx: Context,
+    issue_key: Annotated[
+        str, Field(description="Jira issue key (e.g., 'PROJ-123')")
+    ],
+    source_link: Annotated[
+        bool,
+        Field(
+            description=(
+                "(Optional) Append a last line 'Jira: [KEY](URL)' with the link to the issue."
+            ),
+            default=True,
+        ),
+    ] = True,
+) -> str:
+    """Return the description of a Jira issue as a Markdown file, converted without a model.
+
+    For copying an issue to another system (e.g. Gitea): pass the file on unchanged instead of
+    retyping the text. Text, URLs and file names stay as they are; only the markup changes.
+    Embedded images stay at their place as ![name](name), links to attachments as [name](name),
+    with the attachment file name as target, so the target can be replaced by the URL of the
+    uploaded copy.
+
+    The result is JSON with issue_key, url, summary, issue_type, status, the file
+    (filename '<KEY>.md', mime_type text/markdown, content_base64), images (file names in the
+    order of the text), attachment_links, attachments (id, filename, mime_type, size),
+    referenced_but_missing, attached_but_not_referenced, unconverted (macros left as text),
+    unresolved_mentions and comment_count.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key (e.g., 'PROJ-123').
+        source_link: Append the link to the issue as last line.
+
+    Returns:
+        JSON string with the Markdown file and what the conversion found.
+    """
+    import base64
+
+    from mcp_atlassian.preprocessing.jira_wiki_markdown import wiki_to_markdown
+
+    jira = await get_jira_fetcher(ctx)
+    issue_data = await asyncio.to_thread(
+        jira.jira.issue,
+        issue_key,
+        fields="summary,description,attachment,issuetype,status,comment",
+    )
+    if not isinstance(issue_data, dict) or "fields" not in issue_data:
+        raise ValueError(f"Could not retrieve issue {issue_key}.")
+    fields = issue_data.get("fields") or {}
+    key = issue_data.get("key") or issue_key
+    description = fields.get("description") or ""
+    if not isinstance(description, str):
+        raise ValueError(
+            f"The description of {key} is not wiki markup (type {type(description).__name__})."
+        )
+
+    accounts = list(
+        dict.fromkeys(re.findall(r"\[~(?:accountid:)?([^\]|\s]+)\]", description))
+    )[:_MARKDOWN_MAX_MENTIONS]
+    names = await asyncio.to_thread(_resolve_mentions, jira.jira, accounts)
+
+    conversion = await asyncio.to_thread(wiki_to_markdown, description, names.get)
+    url = f"{jira.config.url.rstrip('/')}/browse/{key}"
+    markdown = conversion.markdown
+    if source_link:
+        markdown = (markdown + "\n\n" if markdown else "") + f"Jira: [{key}]({url})"
+
+    attachments = [
+        {
+            "id": str(att.get("id", "")),
+            "filename": att.get("filename", ""),
+            "mime_type": att.get("mimeType", ""),
+            "size": att.get("size"),
+        }
+        for att in fields.get("attachment") or []
+        if isinstance(att, dict)
+    ]
+    attached = {att["filename"] for att in attachments}
+    referenced = list(dict.fromkeys(conversion.images + conversion.attachment_links))
+    comment = fields.get("comment")
+    comment_count = (
+        comment.get("total", len(comment.get("comments") or []))
+        if isinstance(comment, dict)
+        else 0
+    )
+    result = {
+        "issue_key": key,
+        "url": url,
+        "summary": fields.get("summary", ""),
+        "issue_type": (fields.get("issuetype") or {}).get("name", ""),
+        "status": (fields.get("status") or {}).get("name", ""),
+        "file": {
+            "filename": f"{key}.md",
+            "mime_type": "text/markdown",
+            "content_base64": base64.b64encode(markdown.encode("utf-8")).decode("ascii"),
+        },
+        "images": conversion.images,
+        "attachment_links": conversion.attachment_links,
+        "attachments": attachments,
+        "referenced_but_missing": [n for n in referenced if n not in attached],
+        "attached_but_not_referenced": sorted(attached - set(referenced)),
+        "unconverted": conversion.unconverted,
+        "unresolved_mentions": conversion.mentions,
+        "comment_count": comment_count,
+    }
+    return json.dumps(result, ensure_ascii=False)
+
+
 # --- List tools: check or list many issues in one call -----------------------------------------
 # The model passes a whole list; the server does the paging (Jira Cloud: nextPageToken) and the
 # matching, so a comparison needs one tool call instead of one search per item.

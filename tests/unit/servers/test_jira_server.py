@@ -2753,3 +2753,77 @@ async def test_get_attachment_file_unknown_name(mock_jira_fetcher):
         await _call_get_attachment_file(
             mock_jira_fetcher, issue_key="PROJ-1", filename="missing.pdf"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for get_issue_markdown
+# ---------------------------------------------------------------------------
+
+
+async def _call_get_issue_markdown(mock_jira_fetcher, **params):
+    from mcp_atlassian.servers.jira import get_issue_markdown
+
+    ctx = MagicMock()
+    with patch(
+        "mcp_atlassian.servers.jira.get_jira_fetcher",
+        AsyncMock(return_value=mock_jira_fetcher),
+    ):
+        return await get_issue_markdown.fn(ctx, **params)
+
+
+def _markdown_issue(description, attachments=()):
+    return {
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "Titel",
+            "description": description,
+            "issuetype": {"name": "Story"},
+            "status": {"name": "Offen"},
+            "comment": {"total": 2, "comments": []},
+            "attachment": list(attachments),
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_get_issue_markdown_returns_file_with_images_in_place(mock_jira_fetcher):
+    """The description comes back as Markdown file; images keep their place and file name."""
+    import base64
+
+    mock_jira_fetcher.jira.issue.return_value = _markdown_issue(
+        "Vorher\n!screenshot.png|width=600!\n*fett* [~accountid:abc]",
+        [_PNG_ATTACHMENT, _PDF_ATTACHMENT],
+    )
+    mock_jira_fetcher.jira.user.return_value = {"displayName": "Name A"}
+    result = json.loads(
+        await _call_get_issue_markdown(mock_jira_fetcher, issue_key="PROJ-1")
+    )
+    text = base64.b64decode(result["file"]["content_base64"]).decode("utf-8")
+    assert text == (
+        "Vorher\n![screenshot.png](screenshot.png)\n**fett** @Name A\n\n"
+        "Jira: [PROJ-1](https://test.atlassian.net/browse/PROJ-1)"
+    )
+    assert result["file"]["filename"] == "PROJ-1.md"
+    assert result["file"]["mime_type"] == "text/markdown"
+    assert result["images"] == ["screenshot.png"]
+    assert result["attached_but_not_referenced"] == [_PDF_ATTACHMENT["filename"]]
+    assert result["referenced_but_missing"] == []
+    assert result["comment_count"] == 2
+    assert result["status"] == "Offen"
+
+
+@pytest.mark.anyio
+async def test_get_issue_markdown_without_source_link(mock_jira_fetcher):
+    """source_link=False returns the description alone; missing files are reported."""
+    import base64
+
+    mock_jira_fetcher.jira.issue.return_value = _markdown_issue("!fehlt.png!")
+    result = json.loads(
+        await _call_get_issue_markdown(
+            mock_jira_fetcher, issue_key="PROJ-1", source_link=False
+        )
+    )
+    assert (
+        base64.b64decode(result["file"]["content_base64"]) == b"![fehlt.png](fehlt.png)"
+    )
+    assert result["referenced_but_missing"] == ["fehlt.png"]
