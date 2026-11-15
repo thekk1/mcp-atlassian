@@ -3480,13 +3480,21 @@ def _list_field_ids(jira: Any, names: list[str]) -> dict[str, str]:
     return ids
 
 
-def _list_compact(issue: dict, fields: dict[str, str]) -> dict[str, Any]:
+def _list_compact(issue: dict, fields: dict[str, str], sprint_fields: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """Requested fields of an issue; a Sprint field becomes [{"name", "state"}] for every sprint."""
     raw = issue.get("fields") or {}
     out: dict[str, Any] = {"key": issue.get("key")}
     for name, field in fields.items():
-        if name != "key":
-            out[name] = _list_value(raw.get(field))
+        if name == "key":
+            continue
+        out[name] = _markdown_sprints(raw, [field]) if field in sprint_fields else _list_value(raw.get(field))
     return out
+
+
+def _list_sprint_fields(jira: Any, field_ids: dict[str, str]) -> frozenset[str]:
+    """The requested fields that are Sprint fields (schema type gh-sprint)."""
+    custom = {field for field in field_ids.values() if field.startswith("customfield_")}
+    return frozenset(custom & set(_markdown_sprint_fields(jira))) if custom else frozenset()
 
 
 def _list_fetch_all(jira: Any, jql: str, fields: list[str], limit: int | None) -> list[dict]:
@@ -3666,7 +3674,13 @@ async def list_all(
     ],
     fields: Annotated[
         str,
-        Field(description="Comma-separated fields to return for each issue.", default="summary,status"),
+        Field(
+            description=(
+                "Comma-separated fields to return for each issue. 'sprint' returns every sprint of the "
+                "issue as {name, state} (active, closed or future), closed sprints included."
+            ),
+            default="summary,status",
+        ),
     ] = "summary,status",
     max_results: Annotated[
         int,
@@ -3721,10 +3735,15 @@ async def list_all(
         )
     field_list = [name.strip() for name in fields.split(",") if name.strip()]
     field_ids = await asyncio.to_thread(_list_field_ids, jira, field_list)
+    sprint_fields = await asyncio.to_thread(_list_sprint_fields, jira, field_ids)
     issues = await asyncio.to_thread(_list_fetch_all, jira, jql, list(field_ids.values()), max_results + 1)
     more = len(issues) > max_results
     issues = issues[:max_results]
     return json.dumps(
-        {"count": len(issues), "more": more, "issues": [_list_compact(issue, field_ids) for issue in issues]},
+        {
+            "count": len(issues),
+            "more": more,
+            "issues": [_list_compact(issue, field_ids, sprint_fields) for issue in issues],
+        },
         ensure_ascii=False,
     )

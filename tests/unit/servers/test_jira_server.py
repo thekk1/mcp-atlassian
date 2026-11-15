@@ -2861,3 +2861,38 @@ def test_markdown_sprints_reads_server_strings():
         {"name": "EPP - Sprint 30", "state": "future"}
     ]
     assert _markdown_sprints({"customfield_1": None}, ["customfield_1"]) == []
+
+
+def test_list_compact_returns_sprints_with_state():
+    """jira_list_all: a Sprint field lists every sprint with name and state, other fields stay as before."""
+    from mcp_atlassian.servers.jira import _list_compact, _list_sprint_fields
+
+    class Fetcher:
+        def get_fields(self):
+            return [
+                {"id": "customfield_10020", "schema": {"custom": "com.pyxis.greenhopper.jira:gh-sprint"}},
+                {"id": "customfield_10001", "schema": {"custom": "other"}},
+            ]
+
+    fields = {"summary": "summary", "sprint": "customfield_10020", "team": "customfield_10001"}
+    sprint_fields = _list_sprint_fields(Fetcher(), fields)
+    assert sprint_fields == frozenset({"customfield_10020"})
+    issue = {
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "Titel",
+            "customfield_10020": [
+                {"id": 1, "name": "EPP - Sprint 17", "state": "closed", "boardId": 2},
+                {"id": 2, "name": "Bugs", "state": "future", "boardId": 2},
+            ],
+            "customfield_10001": {"value": "A"},
+        },
+    }
+    assert _list_compact(issue, fields, sprint_fields) == {
+        "key": "PROJ-1",
+        "summary": "Titel",
+        "sprint": [{"name": "EPP - Sprint 17", "state": "closed"}, {"name": "Bugs", "state": "future"}],
+        "team": "A",
+    }
+    assert _list_compact(issue, fields)["sprint"] == ["EPP - Sprint 17", "Bugs"]
+    assert _list_sprint_fields(Fetcher(), {"summary": "summary"}) == frozenset()
